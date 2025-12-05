@@ -1,42 +1,37 @@
 import streamlit as st
 from ultralytics import YOLO
-from PIL import Image
+from PIL import Image, ImageDraw
 import numpy as np
-import cv2 as cv
-import time
 
 st.set_page_config(page_title="Illegal Waste Detection")
 
-st.title("🚮 Illegal Waste Detection System (YOLOv8)")
-st.write("Upload an image to detect waste dumping areas.")
+st.title("🚮 Illegal Waste Detection System")
+st.write("Upload an image to detect dumping.")
 
 @st.cache_resource
 def load_model():
-    return YOLO("best.pt")  # model file must be in same folder
+    return YOLO("best.pt")
 
 model = load_model()
 
-uploaded_file = st.file_uploader("Upload an Image", type=["jpg", "jpeg", "png"])
+uploaded_file = st.file_uploader("Upload Image", type=["jpg", "jpeg", "png"])
 
 if uploaded_file:
     image = Image.open(uploaded_file).convert("RGB")
     st.image(image, caption="Uploaded Image", use_column_width=True)
 
     if st.button("🔍 Detect Waste"):
-        with st.spinner("Detecting..."):
-            img_array = np.array(image)
-            results = model.predict(source=img_array, conf=0.30)
-            result = results[0]
+        st.write("Detection Result:")
+        results = model.predict(np.array(image))
 
-            annotated_img = result.plot()
-            annotated_img = cv2.cvtColor(annotated_img, cv2.COLOR_BGR2RGB)
+        img = image.copy()
+        draw = ImageDraw.Draw(img)
 
-            st.image(annotated_img, caption="Detection Result", use_column_width=True)
+        for box in results[0].boxes:
+            x1, y1, x2, y2 = box.xyxy[0]
+            conf = float(box.conf[0])
 
-            st.subheader("Detection Details")
-            if len(result.boxes) == 0:
-                st.success("🎉 No waste detected!")
-            else:
-                for box in result.boxes:
-                    conf = float(box.conf[0])
-                    st.write(f"Confidence: {conf:.2f}")
+            draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
+            draw.text((x1, y1), f"{conf:.2f}", fill="red")
+
+        st.image(img, caption="Detection Output", use_column_width=True)
