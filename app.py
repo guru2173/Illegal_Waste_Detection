@@ -5,8 +5,14 @@
 # - Uses PIL for drawing (no cv2)
 # - Shows clear errors/warnings in the app
 ##############################################################
-
 import os
+os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "0"
+
+import streamlit as st
+from ultralytics import YOLO
+from PIL import Image
+import numpy as np
+
 import streamlit as st
 from PIL import Image, ImageDraw
 import numpy as np
