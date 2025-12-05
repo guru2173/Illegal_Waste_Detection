@@ -5,12 +5,18 @@ import sys
 import types
 
 cv2_fake = types.SimpleNamespace()
+
+# Required attributes & methods
 cv2_fake.IMREAD_COLOR = 1
+cv2_fake.setNumThreads = lambda *a, **k: None
+cv2_fake.getNumThreads = lambda: 1
 cv2_fake.imread = lambda *a, **k: None
 cv2_fake.imwrite = lambda *a, **k: None
 cv2_fake.imshow = lambda *a, **k: None
 cv2_fake.waitKey = lambda *a, **k: None
+
 sys.modules['cv2'] = cv2_fake
+
 
 ##############################################################
 # ENVIRONMENT FIXES
