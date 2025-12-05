@@ -2,7 +2,7 @@ import streamlit as st
 from ultralytics import YOLO
 from PIL import Image
 import numpy as np
-import cv2
+import cv2 as cv
 import time
 
 st.set_page_config(page_title="Illegal Waste Detection")
