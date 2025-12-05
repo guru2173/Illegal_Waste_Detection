@@ -5,12 +5,12 @@ import sys
 import types
 
 cv2_fake = types.SimpleNamespace()
+cv2_fake.IMREAD_COLOR = 1
 cv2_fake.imread = lambda *a, **k: None
 cv2_fake.imwrite = lambda *a, **k: None
 cv2_fake.imshow = lambda *a, **k: None
 cv2_fake.waitKey = lambda *a, **k: None
 sys.modules['cv2'] = cv2_fake
-
 
 ##############################################################
 # ENVIRONMENT FIXES
@@ -22,7 +22,6 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
 os.environ["DISPLAY"] = "0"
 
-
 ##############################################################
 # IMPORTS
 ##############################################################
@@ -30,6 +29,7 @@ import streamlit as st
 from ultralytics import YOLO
 from PIL import Image, ImageDraw
 import numpy as np
+
 
 
 ##############################################################
