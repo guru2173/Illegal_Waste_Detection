@@ -1,4 +1,4 @@
-##############################################################
+#############################################################
 # Robust Streamlit app for Illegal Waste Detection (YOLO)
 # - NO top-level 'from ultralytics import YOLO' to avoid import-time crashes
 # - Attempts lazy imports inside load_model()
