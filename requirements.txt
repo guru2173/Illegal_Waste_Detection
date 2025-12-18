@@ -1,13 +1,14 @@
-# core
-streamlit==1.22.0
+# Streamlit (Python 3.13 compatible)
+streamlit>=1.52.0
 
-# YOLO / ML
+# YOLO
 ultralytics==8.3.235
+
+# Torch (CPU works fine on Streamlit Cloud)
 torch==2.9.1
 torchvision==0.24.1
-opencv-python-headless==4.11.0.86
 
-# image / utility libs
+# Image & utils
+opencv-python-headless==4.11.0.86
 numpy==2.3.5
 pillow==12.0.0
-imghdr
