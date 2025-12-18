@@ -1,7 +1,13 @@
+# core
 streamlit==1.22.0
+
+# YOLO / ML
 ultralytics==8.3.235
 torch==2.9.1
 torchvision==0.24.1
 opencv-python-headless==4.11.0.86
+
+# image / utility libs
 numpy==2.3.5
 pillow==12.0.0
+imghdr
