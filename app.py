@@ -14,6 +14,17 @@ from PIL import Image, ImageDraw
 import numpy as np
 import traceback
 import importlib
+# debug snippet - remove after debugging
+try:
+    import cv2, sys
+    import inspect
+    cv2_info = getattr(cv2, '__version__', 'n/a')
+    cv2_file = getattr(cv2, '__file__', 'n/a')
+    st.sidebar.text("cv2 version: " + str(cv2_info))
+    st.sidebar.text("cv2 file: " + str(cv2_file))
+except Exception as e:
+    st.sidebar.text("cv2 import error: " + repr(e))
+
 
 
 ##############################################################
