@@ -1,172 +1,165 @@
-# app.py
+##############################################################
+# Robust Streamlit app for Illegal Waste Detection (YOLO)
+# - NO top-level 'from ultralytics import YOLO'
+# - Attempts lazy YOLO imports
+# - Uses PIL (no cv2 required)
+# - Debug messages visible in sidebar
+##############################################################
+
 import os
+os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "0"   # Prevent OpenCV GL errors
+
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 import numpy as np
-import importlib
 import traceback
+import importlib
 
-# optional: hf download
-from huggingface_hub import hf_hub_download, HfHubHTTPError
 
+##############################################################
+# STREAMLIT UI HEADER
+##############################################################
 st.set_page_config(page_title="Illegal Waste Detection", layout="wide")
 st.title("🚮 Illegal Waste Detection (YOLO)")
-
 st.write("Upload an image to detect illegal dumping regions. Model loading is lazy — see sidebar for status.")
 
-# Sidebar settings
-st.sidebar.header("Model settings")
-model_filename = st.sidebar.text_input("Model filename in repo root", "best.pt")
-hf_model_repo = st.sidebar.text_input("Hugging Face model repo (optional)", "")  # e.g., username/illegal-waste-model
-st.sidebar.markdown("If the model file is not in repo, provide HF model repo above (or upload best.pt to repo).")
+##############################################################
+# SIDEBAR SETTINGS
+##############################################################
+st.sidebar.header("Settings")
+model_filename = st.sidebar.text_input("Model filename (in repo root)", "best.pt")
 
-st.sidebar.markdown("## Runtime options")
-device = st.sidebar.selectbox("Device", ["cpu", "cuda"] if os.environ.get("CUDA_VISIBLE_DEVICES") else ["cpu"])
 
-# Helper to import YOLO class safely
+##############################################################
+# TRY IMPORT YOLO IN DIFFERENT WAYS
+##############################################################
 def try_import_yolo():
+    """
+    Return (YOLO_class, error_list)
+    YOLO_class = None if import failed.
+    """
     errors = []
     YOLO = None
+
+    # Try main ultralytics import
     try:
         mod = importlib.import_module("ultralytics")
         YOLO = getattr(mod, "YOLO", None)
         if YOLO is not None:
             return YOLO, errors
-        errors.append(("ultralytics module; attribute YOLO missing", "ultralytics loaded but YOLO attribute not present"))
+        errors.append(("ultralytics: YOLO missing", "ultralytics loaded but no YOLO attr"))
     except Exception as e:
         errors.append(("from ultralytics import YOLO", repr(e)))
 
+    # Try engine path
     try:
         mod2 = importlib.import_module("ultralytics.yolo.engine.model")
         YOLO = getattr(mod2, "YOLO", None)
         if YOLO is not None:
             return YOLO, errors
-        errors.append(("ultralytics.yolo.engine.model; YOLO attr missing", "module loaded but YOLO attribute missing"))
+        errors.append(("ultralytics.yolo.engine.model", "loaded but no YOLO attr"))
     except Exception as e:
         errors.append(("import ultralytics.yolo.engine.model", repr(e)))
 
-    try:
-        mod3 = importlib.import_module("ultralytics.yolo")
-        if hasattr(mod3, "YOLO"):
-            return getattr(mod3, "YOLO"), errors
-        errors.append(("import ultralytics.yolo", "loaded but YOLO not found"))
-    except Exception as e:
-        errors.append(("import ultralytics.yolo", repr(e)))
-
     return None, errors
 
-# cached model loader
+
+##############################################################
+# LAZY MODEL LOADING
+##############################################################
 @st.cache_resource
-def load_model_local_or_hf(local_path, hf_repo=None, hf_token=None, device="cpu"):
+def load_model(path):
     YOLO_class, import_errors = try_import_yolo()
     if YOLO_class is None:
-        msg = "Unable to import YOLO class. Import attempts:\n"
+        msg = ["Unable to import YOLO:"]
         for name, err in import_errors:
-            msg += f"- {name}: {err}\n"
-        return None, msg
+            msg.append(f"- {name}: {err}")
+        return None, "\n".join(msg)
 
-    # if local file exists, use it
-    if os.path.exists(local_path):
-        try:
-            model = YOLO_class(local_path)
-            # set device if supported
-            try:
-                model.to(device)
-            except Exception:
-                pass
-            return model, None
-        except Exception as e:
-            return None, f"Failed to load local model '{local_path}': {repr(e)}\n" + traceback.format_exc()
+    if not os.path.exists(path):
+        return None, f"Model '{path}' not found in repo root!"
 
-    # else if hf_repo specified, try downloading
-    if hf_repo:
-        try:
-            # download file; will throw if not available
-            downloaded = hf_hub_download(repo_id=hf_repo, filename=local_path, use_auth_token=hf_token)
-            try:
-                model = YOLO_class(downloaded)
-                try:
-                    model.to(device)
-                except Exception:
-                    pass
-                return model, None
-            except Exception as e:
-                return None, f"Failed to load model after download from HF repo: {repr(e)}\n" + traceback.format_exc()
-        except HfHubHTTPError as e:
-            return None, f"HuggingFace Hub download error: {repr(e)}"
-        except Exception as e:
-            return None, f"Unexpected error when downloading from HF hub: {repr(e)}\n{traceback.format_exc()}"
+    try:
+        model = YOLO_class(path)
+        return model, None
+    except Exception as e:
+        tb = traceback.format_exc()
+        return None, f"Model load error: {repr(e)}\n{tb}"
 
-    return None, f"Model file '{local_path}' not found in repo and no HF repo provided."
 
-# Sidebar: load model button
-st.sidebar.markdown("## Model loader")
-if st.sidebar.button("Load model now"):
-    hf_token = os.environ.get("HF_TOKEN", None)
-    model_obj, model_err = load_model_local_or_hf(model_filename, hf_model_repo or None, hf_token, device=device)
+##############################################################
+# MODEL LOADER BUTTON
+##############################################################
+st.sidebar.markdown("## Model Loader")
+if st.sidebar.button("Load Model Now"):
+    model_obj, model_err = load_model(model_filename)
     if model_obj is None:
-        st.sidebar.error("Model NOT loaded.")
-        st.sidebar.text_area("Load errors (copy for debugging)", value=str(model_err), height=240)
+        st.sidebar.error("❌ Model NOT loaded.")
+        st.sidebar.text_area("Load errors", value=model_err, height=220)
+        st.warning("Model not loaded.")
     else:
-        st.sidebar.success("Model loaded successfully. Use the Run Detection button on main page.")
+        st.sidebar.success("✅ Model loaded successfully.")
 
-# Show quick check for YOLO presence
+
+##############################################################
+# YOLO AVAILABILITY CHECK (debug)
+##############################################################
 yo, yo_errs = try_import_yolo()
 if yo is None:
-    st.sidebar.error("YOLO class not available in this environment.")
-    st.sidebar.markdown("Try these fixes:")
-    st.sidebar.markdown("- Ensure `ultralytics` is in `requirements.txt`.\n- Use `opencv-python-headless`.\n- If you previously created `cv2.py` in repo root delete it.")
-    st.sidebar.text_area("YOLO import attempts (debug)", "\n".join([f"{n} : {e}" for n, e in yo_errs]), height=240)
+    st.sidebar.error("⚠️ YOLO class NOT available.")
+    st.sidebar.markdown("Try:")
+    st.sidebar.markdown("- Make sure `ultralytics` is in requirements.txt")
+    st.sidebar.markdown("- Pin: `ultralytics==8.3.235` ")
+    st.sidebar.text_area("Debug", "\n".join([f"{n}: {e}" for n, e in yo_errs]), height=200)
 else:
-    st.sidebar.success("YOLO class detected in environment.")
+    st.sidebar.success("YOLO detected.")
 
-# Main UI
-uploaded_file = st.file_uploader("Upload image (jpg/jpeg/png)", type=["jpg", "jpeg", "png"])
+
+##############################################################
+# MAIN FILE UPLOAD
+##############################################################
+uploaded_file = st.file_uploader("Upload image (jpg,jpeg,png)", type=["jpg", "jpeg", "png"])
 if uploaded_file is None:
-    st.info("Upload an image to run detection (model must be loaded first).")
-else:
-    image = Image.open(uploaded_file).convert("RGB")
-    st.image(image, caption="Uploaded image", use_column_width=True)
+    st.info("Upload an image to run detection.")
+    st.stop()
 
-    if st.button("🔍 Run Detection (lazy load model if not loaded)"):
-        hf_token = os.environ.get("HF_TOKEN", None)
-        model_obj, model_err = load_model_local_or_hf(model_filename, hf_model_repo or None, hf_token, device=device)
-        if model_obj is None:
-            st.error("Cannot run detection: model not loaded.")
-            st.text(model_err)
+image = Image.open(uploaded_file).convert("RGB")
+st.image(image, caption="Uploaded image", use_column_width=True)
+
+
+##############################################################
+# RUN DETECTION
+##############################################################
+if st.button("🔍 Run Detection"):
+    model_obj, model_err = load_model(model_filename)
+    if model_obj is None:
+        st.error("Cannot run detection: model not loaded")
+        st.text(model_err)
+        st.stop()
+
+    try:
+        results = model_obj.predict(np.array(image))
+        detections = results[0]
+
+        draw_img = image.copy()
+        draw = ImageDraw.Draw(draw_img)
+        count = 0
+
+        for box in detections.boxes:
+            count += 1
+            x1, y1, x2, y2 = box.xyxy[0]
+            conf = float(box.conf[0])
+            draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
+            draw.text((x1, y1), f"{conf*100:.1f}%", fill="red")
+
+        st.image(draw_img, caption=f"Detections: {count}", use_column_width=True)
+
+        if count == 0:
+            st.success("No illegal waste detected.")
         else:
-            try:
-                # run prediction (you can tune imgsz, conf, etc)
-                results = model_obj.predict(np.array(image), imgsz=640, conf=0.25)
-                det = results[0]
-                draw_img = image.copy()
-                draw = ImageDraw.Draw(draw_img)
-                font = None
-                try:
-                    font = ImageFont.load_default()
-                except Exception:
-                    pass
+            st.error(f"Detected {count} illegal waste region(s).")
 
-                count = 0
-                # Ultralytics' boxes accessor
-                for box in det.boxes:
-                    count += 1
-                    xyxy = box.xyxy[0].cpu().numpy() if hasattr(box.xyxy[0], "cpu") else np.array(box.xyxy[0])
-                    x1, y1, x2, y2 = map(float, xyxy)
-                    conf = float(box.conf[0]) if hasattr(box, "conf") else 0.0
-                    label = getattr(box, "cls", None)
-                    draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
-                    text = f"{conf*100:.1f}%"
-                    draw.text((x1, y1-10), text, fill="red", font=font)
-
-                st.image(draw_img, caption=f"Detections ({count})", use_column_width=True)
-                if count == 0:
-                    st.success("No illegal waste detected.")
-                else:
-                    st.error(f"Illegal waste detected in {count} region(s).")
-
-            except Exception as e:
-                st.error("Error during detection. See debug below.")
-                st.text(str(e))
-                with st.expander("Full traceback"):
-                    st.text(traceback.format_exc())
+    except Exception as e:
+        st.error("Error during detection!")
+        st.text(repr(e))
+        st.text(traceback.format_exc())
