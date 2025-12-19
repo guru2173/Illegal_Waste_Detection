@@ -1,3 +1,6 @@
-streamlit>=1.18.0
-requests>=2.31.0
-Pillow>=9.5.0
+streamlit
+ultralytics==8.3.235
+opencv-python-headless
+pillow
+numpy
+huggingface-hub
