@@ -1,239 +1,172 @@
 # app.py
-import io
-import base64
 import os
-import time
-from typing import Tuple, Optional
-
-import requests
-from PIL import Image
 import streamlit as st
+from PIL import Image, ImageDraw, ImageFont
+import numpy as np
+import importlib
+import traceback
 
-st.set_page_config("Illegal Waste (light) — Classifier", layout="wide")
+# optional: hf download
+from huggingface_hub import hf_hub_download, HfHubHTTPError
 
-st.title("Illegal Waste — lightweight deploy (no YOLO)")
+st.set_page_config(page_title="Illegal Waste Detection", layout="wide")
+st.title("🚮 Illegal Waste Detection (YOLO)")
 
-st.markdown(
-    """
-This app avoids heavy YOLO/ultralytics installs.  
-**Preferred**: use Hugging Face Inference API (no heavy native libs).  
-**Fallback**: local `torchvision` model if `torch` is installed in your environment.
-"""
-)
+st.write("Upload an image to detect illegal dumping regions. Model loading is lazy — see sidebar for status.")
 
-# Helper: read secrets or user input token
-HF_TOKEN_FROM_SECRETS = st.secrets.get("HF_API_TOKEN") if hasattr(st, "secrets") else None
+# Sidebar settings
+st.sidebar.header("Model settings")
+model_filename = st.sidebar.text_input("Model filename in repo root", "best.pt")
+hf_model_repo = st.sidebar.text_input("Hugging Face model repo (optional)", "")  # e.g., username/illegal-waste-model
+st.sidebar.markdown("If the model file is not in repo, provide HF model repo above (or upload best.pt to repo).")
 
-col1, col2 = st.columns([1, 2])
+st.sidebar.markdown("## Runtime options")
+device = st.sidebar.selectbox("Device", ["cpu", "cuda"] if os.environ.get("CUDA_VISIBLE_DEVICES") else ["cpu"])
 
-with col1:
-    st.header("Settings")
-    st.text_input("Model filename (ignored for HF mode)", value="best.pt", key="model_filename")
-    st.write("Mode:")
-    use_hf_default = True
-    mode = st.radio(
-        "Run inference via",
-        ("Hugging Face API (recommended)", "Local torchvision (if available)", "Heuristic fallback"),
-        index=0 if use_hf_default else 1,
-    )
-
-    hf_token = HF_TOKEN_FROM_SECRETS or st.text_input(
-        "Hugging Face API token (paste or add to Streamlit Secrets as HF_API_TOKEN)",
-        value="",
-        placeholder="hf_xxx...",
-        type="password",
-    )
-    hf_model = st.text_input(
-        "Hugging Face model id (image-classification)",
-        value="google/vit-base-patch16-224",
-        help="Examples: google/vit-base-patch16-224, microsoft/resnet-50",
-    )
-
-    st.markdown("---")
-    st.write("Confidence threshold (UI only)")
-    conf_thr = st.slider("Confidence threshold", 0.0, 1.0, 0.25)
-
-with col2:
-    st.header("Upload image")
-    uploaded = st.file_uploader("Image (jpg/png)", type=["jpg", "jpeg", "png"])
-    if uploaded:
-        try:
-            img = Image.open(uploaded).convert("RGB")
-            st.image(img, caption="Uploaded image", use_column_width=True)
-        except Exception as e:
-            st.error(f"Could not open uploaded image: {e}")
-            uploaded = None
-
-# --- Inference helpers ---
-
-def call_huggingface_classify(image_bytes: bytes, model: str, token: str, timeout=30):
-    """
-    Calls Hugging Face Inference API to get image classification.
-    Sends raw image bytes to the model endpoint.
-    """
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
-    url = f"https://api-inference.huggingface.co/models/{model}"
+# Helper to import YOLO class safely
+def try_import_yolo():
+    errors = []
+    YOLO = None
     try:
-        resp = requests.post(url, headers=headers, data=image_bytes, timeout=timeout)
+        mod = importlib.import_module("ultralytics")
+        YOLO = getattr(mod, "YOLO", None)
+        if YOLO is not None:
+            return YOLO, errors
+        errors.append(("ultralytics module; attribute YOLO missing", "ultralytics loaded but YOLO attribute not present"))
     except Exception as e:
-        return {"error": f"Request error: {e}"}
-    if resp.status_code == 503:
-        return {"error": "Model is loading on HF (503). Try again in a bit."}
-    if resp.status_code >= 400:
-        return {"error": f"HF API error {resp.status_code}: {resp.text}"}
+        errors.append(("from ultralytics import YOLO", repr(e)))
+
     try:
-        return resp.json()
+        mod2 = importlib.import_module("ultralytics.yolo.engine.model")
+        YOLO = getattr(mod2, "YOLO", None)
+        if YOLO is not None:
+            return YOLO, errors
+        errors.append(("ultralytics.yolo.engine.model; YOLO attr missing", "module loaded but YOLO attribute missing"))
     except Exception as e:
-        return {"error": f"Invalid JSON from HF: {e}"}
+        errors.append(("import ultralytics.yolo.engine.model", repr(e)))
 
-# Local torchvision fallback (only used if torch is installed)
-def local_torch_available() -> bool:
     try:
-        import torch  # noqa: F401
-        import torchvision  # noqa: F401
-        return True
-    except Exception:
-        return False
+        mod3 = importlib.import_module("ultralytics.yolo")
+        if hasattr(mod3, "YOLO"):
+            return getattr(mod3, "YOLO"), errors
+        errors.append(("import ultralytics.yolo", "loaded but YOLO not found"))
+    except Exception as e:
+        errors.append(("import ultralytics.yolo", repr(e)))
 
+    return None, errors
+
+# cached model loader
 @st.cache_resource
-def load_local_model():
-    """
-    Load a small torchvision model (ResNet18 pre-trained).
-    This will only be called if torch is available in the environment.
-    """
-    import torch
-    from torchvision import models, transforms
+def load_model_local_or_hf(local_path, hf_repo=None, hf_token=None, device="cpu"):
+    YOLO_class, import_errors = try_import_yolo()
+    if YOLO_class is None:
+        msg = "Unable to import YOLO class. Import attempts:\n"
+        for name, err in import_errors:
+            msg += f"- {name}: {err}\n"
+        return None, msg
 
-    model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-    # Replace last fc with 2-class head if you have a custom trained model.
-    # Here we keep original imagenet classes for demo.
-    model.eval()
-    preproc = transforms.Compose(
-        [
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-            ),
-        ]
-    )
-    return model, preproc
+    # if local file exists, use it
+    if os.path.exists(local_path):
+        try:
+            model = YOLO_class(local_path)
+            # set device if supported
+            try:
+                model.to(device)
+            except Exception:
+                pass
+            return model, None
+        except Exception as e:
+            return None, f"Failed to load local model '{local_path}': {repr(e)}\n" + traceback.format_exc()
 
-def classify_local(img: Image.Image) -> Tuple[str, float]:
-    """
-    Run local torchvision model and return best label + prob.
-    Uses ImageNet labels (for demo). If you have a custom local model,
-    replace this loading and mapping accordingly.
-    """
-    import torch
-    import json
-    from torchvision import transforms
+    # else if hf_repo specified, try downloading
+    if hf_repo:
+        try:
+            # download file; will throw if not available
+            downloaded = hf_hub_download(repo_id=hf_repo, filename=local_path, use_auth_token=hf_token)
+            try:
+                model = YOLO_class(downloaded)
+                try:
+                    model.to(device)
+                except Exception:
+                    pass
+                return model, None
+            except Exception as e:
+                return None, f"Failed to load model after download from HF repo: {repr(e)}\n" + traceback.format_exc()
+        except HfHubHTTPError as e:
+            return None, f"HuggingFace Hub download error: {repr(e)}"
+        except Exception as e:
+            return None, f"Unexpected error when downloading from HF hub: {repr(e)}\n{traceback.format_exc()}"
 
-    model, preproc = load_local_model()
-    x = preproc(img).unsqueeze(0)
-    with torch.no_grad():
-        logits = model(x)
-        probs = torch.nn.functional.softmax(logits, dim=1)[0]
-        top_idx = int(probs.argmax().item())
-        top_score = float(probs[top_idx].item())
+    return None, f"Model file '{local_path}' not found in repo and no HF repo provided."
 
-    # Try to load ImageNet labels (optional local file or remote)
-    imagenet_labels = None
-    labels_path = os.path.join(os.path.dirname(__file__), "imagenet_labels.txt")
-    if os.path.exists(labels_path):
-        with open(labels_path, "r", encoding="utf-8") as f:
-            imagenet_labels = [l.strip() for l in f.readlines()]
-    if imagenet_labels and top_idx < len(imagenet_labels):
-        label = imagenet_labels[top_idx]
+# Sidebar: load model button
+st.sidebar.markdown("## Model loader")
+if st.sidebar.button("Load model now"):
+    hf_token = os.environ.get("HF_TOKEN", None)
+    model_obj, model_err = load_model_local_or_hf(model_filename, hf_model_repo or None, hf_token, device=device)
+    if model_obj is None:
+        st.sidebar.error("Model NOT loaded.")
+        st.sidebar.text_area("Load errors (copy for debugging)", value=str(model_err), height=240)
     else:
-        label = f"ImageNet class #{top_idx}"
-    return label, top_score
+        st.sidebar.success("Model loaded successfully. Use the Run Detection button on main page.")
 
-def heuristic_classifier(img: Image.Image) -> Tuple[str, float]:
-    """
-    Dummy heuristic classifier that checks 'trash-like' colors / shapes by simple
-    heuristics. USE ONLY as placeholder so UI remains functional.
-    """
-    import numpy as np
-    arr = np.array(img.resize((128, 128))).astype("int32")
-    # Quick heuristic: lots of gray/white pixels may indicate cloth/bag
-    grayness = np.mean(np.abs(arr - arr.mean(axis=2, keepdims=True)))
-    brightness = arr.mean()
-    score = max(0.0, min(1.0, (200 - grayness) / 200.0))  # arbitrary
-    label = "Illegal Waste (heuristic)" if score > 0.5 else "No Illegal Waste (heuristic)"
-    return label, float(score)
+# Show quick check for YOLO presence
+yo, yo_errs = try_import_yolo()
+if yo is None:
+    st.sidebar.error("YOLO class not available in this environment.")
+    st.sidebar.markdown("Try these fixes:")
+    st.sidebar.markdown("- Ensure `ultralytics` is in `requirements.txt`.\n- Use `opencv-python-headless`.\n- If you previously created `cv2.py` in repo root delete it.")
+    st.sidebar.text_area("YOLO import attempts (debug)", "\n".join([f"{n} : {e}" for n, e in yo_errs]), height=240)
+else:
+    st.sidebar.success("YOLO class detected in environment.")
 
-# --- Run inference based on selected mode ---
-if uploaded:
-    img_bytes = uploaded.getvalue()
-    result_msg = None
-    if mode.startswith("Hugging Face"):
-        if not hf_token:
-            st.warning("No HF token provided. Add HF_API_TOKEN in Streamlit Secrets or paste above to use HF API.")
-            # allow user to continue to local/heuristic fallback
+# Main UI
+uploaded_file = st.file_uploader("Upload image (jpg/jpeg/png)", type=["jpg", "jpeg", "png"])
+if uploaded_file is None:
+    st.info("Upload an image to run detection (model must be loaded first).")
+else:
+    image = Image.open(uploaded_file).convert("RGB")
+    st.image(image, caption="Uploaded image", use_column_width=True)
+
+    if st.button("🔍 Run Detection (lazy load model if not loaded)"):
+        hf_token = os.environ.get("HF_TOKEN", None)
+        model_obj, model_err = load_model_local_or_hf(model_filename, hf_model_repo or None, hf_token, device=device)
+        if model_obj is None:
+            st.error("Cannot run detection: model not loaded.")
+            st.text(model_err)
         else:
-            with st.spinner("Sending image to Hugging Face Inference API..."):
-                hf_resp = call_huggingface_classify(img_bytes, hf_model, hf_token)
-            if isinstance(hf_resp, dict) and hf_resp.get("error"):
-                st.error(f"Hugging Face error: {hf_resp['error']}")
-                result_msg = None
-            else:
-                # HF returns list of {label,score}
-                preds = hf_resp
-                if isinstance(preds, dict) and "error" in preds:
-                    st.error(f"Hugging Face error: {preds['error']}")
+            try:
+                # run prediction (you can tune imgsz, conf, etc)
+                results = model_obj.predict(np.array(image), imgsz=640, conf=0.25)
+                det = results[0]
+                draw_img = image.copy()
+                draw = ImageDraw.Draw(draw_img)
+                font = None
+                try:
+                    font = ImageFont.load_default()
+                except Exception:
+                    pass
+
+                count = 0
+                # Ultralytics' boxes accessor
+                for box in det.boxes:
+                    count += 1
+                    xyxy = box.xyxy[0].cpu().numpy() if hasattr(box.xyxy[0], "cpu") else np.array(box.xyxy[0])
+                    x1, y1, x2, y2 = map(float, xyxy)
+                    conf = float(box.conf[0]) if hasattr(box, "conf") else 0.0
+                    label = getattr(box, "cls", None)
+                    draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
+                    text = f"{conf*100:.1f}%"
+                    draw.text((x1, y1-10), text, fill="red", font=font)
+
+                st.image(draw_img, caption=f"Detections ({count})", use_column_width=True)
+                if count == 0:
+                    st.success("No illegal waste detected.")
                 else:
-                    if len(preds) == 0:
-                        st.warning("No predictions returned from HF model.")
-                    else:
-                        top = preds[0]
-                        label = top.get("label", "unknown")
-                        score = float(top.get("score", 0.0))
-                        st.success(f"Prediction (HF): **{label}** — {score:.2f}")
-                        st.progress(min(1.0, score))
-                        st.json(preds[:5])
-                        result_msg = (label, score)
+                    st.error(f"Illegal waste detected in {count} region(s).")
 
-    if result_msg is None and mode.startswith("Local"):
-        if local_torch_available():
-            try:
-                with st.spinner("Running local torchvision model..."):
-                    label, score = classify_local(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
-                    st.success(f"Prediction (local): **{label}** — {score:.2f}")
-                    st.progress(min(1.0, score))
-                    result_msg = (label, score)
             except Exception as e:
-                st.error(f"Local model failed: {e}")
-        else:
-            st.error("Local torchvision/torch not available in this environment.")
-
-    if result_msg is None and mode.startswith("Heuristic"):
-        with st.spinner("Running heuristic fallback..."):
-            label, score = heuristic_classifier(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
-            st.info(f"Prediction (heuristic): **{label}** — {score:.2f}")
-            st.progress(min(1.0, score))
-            result_msg = (label, score)
-
-    # If no mode produced a result yet, attempt fallback order: HF -> local -> heuristic
-    if result_msg is None and mode.startswith("Hugging Face"):
-        # try local
-        if local_torch_available():
-            try:
-                with st.spinner("Trying local model as fallback..."):
-                    label, score = classify_local(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
-                    st.success(f"Fallback local prediction: **{label}** — {score:.2f}")
-                    result_msg = (label, score)
-            except Exception as e:
-                st.error(f"Fallback local model failed: {e}")
-        if result_msg is None:
-            with st.spinner("Using heuristic fallback..."):
-                label, score = heuristic_classifier(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
-                st.info(f"Fallback heuristic: **{label}** — {score:.2f}")
-                result_msg = (label, score)
-
-    # final result block
-    if result_msg:
-        label, score = result_msg
-        st.write("---")
-        st.markdown(f"**Final:** {label} — confidence {score:.2f}")
-        st.write("Confidence threshold (UI):", conf_thr)
+                st.error("Error during detection. See debug below.")
+                st.text(str(e))
+                with st.expander("Full traceback"):
+                    st.text(traceback.format_exc())
