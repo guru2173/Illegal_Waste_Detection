@@ -1,7 +1,10 @@
 streamlit==1.52.0
-ultralytics==8.3.235
+# The headless version is good, but Ultralytics might still pull the standard one.
+# The packages.txt fix above resolves the conflict regardless.
 opencv-python-headless==4.11.0.86
+ultralytics==8.3.235
 pillow==12.0.0
 numpy==2.3.5
+# Torch versions are usually handled by the environment, but keeping them is okay
 torch==2.9.1
 torchvision==0.24.1
