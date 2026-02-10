@@ -27,6 +27,9 @@ st.write("Upload an image to detect illegal dumping regions. Model loading is la
 st.sidebar.header("Settings")
 model_filename = st.sidebar.text_input("Model filename (in repo root)", "best.pt")
 
+# Add confidence slider to sidebar
+conf_threshold = st.sidebar.slider("Confidence Threshold", min_value=0.0, max_value=1.0, value=0.25, step=0.05)
+
 st.sidebar.markdown("If YOLO class cannot be imported, follow instructions shown below.")
 
 # -------------------------
@@ -167,7 +170,9 @@ else:
             # Run prediction (wrap in try/except)
             try:
                 # ultralytics model.predict accepts numpy arrays
-                results = model_obj.predict(np.array(image))
+                # Passing conf=conf_threshold from sidebar slider
+                results = model_obj.predict(np.array(image), conf=conf_threshold)
+                
                 if results is None or len(results) == 0:
                     st.warning("Model returned no results object.")
                 else:
@@ -225,9 +230,9 @@ else:
 
                         st.image(draw_img, caption=f"Detections ({count})", use_column_width=True)
                         if count == 0:
-                            st.success("No illegal waste detected (confidence threshold may be high).")
+                            st.success(f"No illegal waste detected at {conf_threshold*100:.0f}% confidence.")
                         else:
-                            st.error(f"Illegal waste detected in {count} region(s).")
+                            st.error(f"Illegal waste detected in {count} region(s) (threshold: {conf_threshold}).")
             except Exception as e:
                 st.error("Error during model prediction. See debug below.")
                 st.text(repr(e))
