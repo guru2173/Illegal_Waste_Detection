@@ -6,13 +6,20 @@
 # - prints helpful debug messages when imports fail
 ##############################################################
 import os
+import sys
+import subprocess
 import importlib
+import importlib.util
 import traceback
 from typing import Tuple, Optional
 
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
+
+# Ensure Ultralytics can write settings (avoids "not writable" warning)
+os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
+os.makedirs(os.environ["YOLO_CONFIG_DIR"], exist_ok=True)
 
 # small env tweak (keeps OpenEXR disabled)
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "0"
@@ -26,10 +33,6 @@ st.write("Upload an image to detect illegal dumping regions. Model loading is la
 # -------------------------
 st.sidebar.header("Settings")
 model_filename = st.sidebar.text_input("Model filename (in repo root)", "best.pt")
-
-# Add confidence slider to sidebar
-conf_threshold = st.sidebar.slider("Confidence Threshold", min_value=0.0, max_value=1.0, value=0.25, step=0.05)
-
 st.sidebar.markdown("If YOLO class cannot be imported, follow instructions shown below.")
 
 # -------------------------
@@ -52,6 +55,147 @@ def opencv_debug() -> str:
 
 # show OpenCV diagnostic to developer
 st.sidebar.text_area("OpenCV debug", value=opencv_debug(), height=120)
+
+# -------------------------
+# Enhanced runtime environment / import debug helper (temporary)
+# -------------------------
+def yolo_import_debug():
+    """
+    Provide helpful runtime diagnostics about the 'ultralytics' package and
+    possible repo shadowing (cv2.py, local ultralytics package).
+    Keep this active while debugging deployment; remove it later.
+    """
+    info = []
+    info.append(f"sys.version: {sys.version.splitlines()[0]}")
+    info.append(f"sys.executable: {sys.executable}")
+    info.append(f"cwd: {os.getcwd()}")
+    info.append(f"sys.path (first 6): {sys.path[:6]!r}")
+
+    # find_spec details
+    try:
+        spec = importlib.util.find_spec("ultralytics")
+        info.append(f"ultralytics find_spec: {spec!r}")
+        if spec is not None:
+            origin = getattr(spec, "origin", None)
+            submodule_search_locations = getattr(spec, "submodule_search_locations", None)
+            info.append(f"origin: {origin}")
+            info.append(f"submodule_search_locations: {submodule_search_locations}")
+    except Exception as e:
+        info.append(f"ultralytics find_spec error: {repr(e)}")
+
+    # Try to import (capture errors) and show basic module info
+    try:
+        mod = importlib.import_module("ultralytics")
+        info.append(f"ultralytics module file: {getattr(mod, '__file__', repr(mod))}")
+        info.append(f"ultralytics.YOLO present: {hasattr(mod, 'YOLO')}")
+        try:
+            YOLO_attr = getattr(mod, "YOLO", None)
+            info.append(f"ultralytics.YOLO repr (short): {repr(YOLO_attr)[:200]}")
+        except Exception:
+            info.append("ultralytics.YOLO repr: <error obtaining repr>")
+    except Exception as e:
+        info.append(f"ultralytics import error: {repr(e)}")
+
+    # quick package import/version checks (non-blocking)
+    pkgs = []
+    candidates = [
+        ("ultralytics", "ultralytics"),
+        ("torch", "torch"),
+        ("torchvision", "torchvision"),
+        ("opencv-python", "cv2"),
+        ("opencv-python-headless", "cv2"),
+        ("numpy", "numpy"),
+        ("streamlit", "streamlit"),
+    ]
+    for display, module_name in candidates:
+        try:
+            m = importlib.import_module(module_name)
+            ver = getattr(m, "__version__", None)
+            pkgs.append(f"{display}: {ver}")
+        except Exception as ex:
+            pkgs.append(f"{display}: import error ({repr(ex)})")
+    info.append("quick package checks: " + "; ".join(pkgs))
+
+    # Check for repo-shadowing files that commonly cause problems
+    repo_root = os.getcwd()
+    shadow_checks = []
+    cv2_path = os.path.join(repo_root, "cv2.py")
+    shadow_checks.append(f"cv2.py exists at repo root: {os.path.exists(cv2_path)} ({cv2_path})")
+    ultra_dir = os.path.join(repo_root, "ultralytics")
+    shadow_checks.append(f"ultralytics/ dir exists in repo root: {os.path.exists(ultra_dir)} ({ultra_dir})")
+    try:
+        root_listing = sorted(os.listdir(repo_root))
+        info.append("Repo root listing (first 160 chars): " + ", ".join(root_listing)[:160])
+    except Exception as e:
+        info.append(f"Could not list repo root: {repr(e)}")
+
+    info.append("")
+    info.append("Shadow checks:")
+    info.extend(shadow_checks)
+
+    # If the main import error is libGL, show actionable message
+    details = "\n".join(info)
+    if "libGL.so.1" in details or "libGL" in details:
+        details += "\n\nACTION: The environment is missing system OpenGL libs (libGL)."
+        details += "\n- Preferred fix (no system packages needed on many hosts): ensure 'opencv-python-headless' is installed and that 'opencv-python' is NOT installed."
+        details += "\n  -> Update requirements.txt to list opencv-python-headless (before ultralytics) and remove any opencv-python entries, then redeploy."
+        details += "\n- Alternative (requires system package install): install system library 'libgl1' / 'libgl1-mesa-glx' (via apt) on hosts that allow apt."
+        details += "\n- If you're on a platform that cannot apt (e.g., Streamlit Community Cloud), use headless OpenCV in requirements or deploy to a host that allows adding system packages (Hugging Face Spaces with apt or a Docker-based host)."
+
+    st.sidebar.text_area("YOLO debug (temporary)", details, height=360)
+
+
+# Call it once (remove after debugging)
+yolo_import_debug()
+
+# -------------------------
+# Utility: robust conversion to numpy
+# -------------------------
+def to_numpy(x):
+    """
+    Convert common Ultralytics/torch-like objects to a numpy array of floats.
+    Handles: torch tensors, numpy arrays, lists/iterables of numbers/lists.
+    Returns None for None input.
+    """
+    if x is None:
+        return None
+    # torch tensors
+    try:
+        import torch
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().numpy().astype(float)
+    except Exception:
+        pass
+
+    # numpy arrays
+    if isinstance(x, np.ndarray):
+        try:
+            return x.astype(float)
+        except Exception:
+            return x
+
+    # some ultralytics/tensor-like objects expose .numpy() or .cpu()
+    if hasattr(x, "numpy"):
+        try:
+            return x.numpy().astype(float)
+        except Exception:
+            pass
+    if hasattr(x, "cpu"):
+        try:
+            return x.cpu().numpy().astype(float)
+        except Exception:
+            pass
+
+    # Try to coerce iterable-of-iterables to numpy explicitly
+    try:
+        return np.array([list(map(float, item)) for item in x], dtype=float)
+    except Exception:
+        # last resort: try a direct conversion to float array
+        try:
+            return np.array(x, dtype=float)
+        except Exception:
+            # give up and return None to indicate failure
+            return None
 
 # -------------------------
 # Attempt to import YOLO (lazy)
@@ -109,6 +253,12 @@ def load_model(path: str) -> Tuple[Optional[object], Optional[str]]:
         msg_lines = ["Unable to import YOLO class. Import attempts:"]
         for name, err in import_errors:
             msg_lines.append(f"- {name}: {err}")
+        msg_lines.append("")
+        msg_lines.append("Common fixes:")
+        msg_lines.append("- Ensure `ultralytics==8.3.235` is listed in requirements.txt")
+        msg_lines.append("- Ensure only `opencv-python-headless` is installed (remove any `opencv-python`)")
+        msg_lines.append("- Remove any file named `cv2.py` or a local `ultralytics` package in the repo root")
+        msg_lines.append("- If environment shows libGL error, either use headless opencv or install libgl system package (apt)")
         return None, "\n".join(msg_lines)
 
     # YOLO class present: try to load the .pt file
@@ -138,7 +288,13 @@ if st.sidebar.button("Load Model Now"):
 yo_cls, yo_errs = try_import_yolo()
 if yo_cls is None:
     st.sidebar.error("⚠️ YOLO class NOT available.")
-    st.sidebar.markdown("Try:\n- Ensure `ultralytics` is in `requirements.txt`.\n- Pin `ultralytics==8.3.235` in `requirements.txt`.\n- Delete any `cv2.py` file in repo root (it shadows real OpenCV).")
+    st.sidebar.markdown(
+        "Try:\n"
+        "- Ensure `ultralytics==8.3.235` is in `requirements.txt`.\n"
+        "- Ensure only `opencv-python-headless` is listed (remove any `opencv-python`).\n"
+        "- Delete any `cv2.py` file in repo root (it shadows real OpenCV).\n"
+        "- Remove any local `ultralytics` folder in repo root that would shadow the installed package."
+    )
     # show debug lines
     st.sidebar.text_area("YOLO import attempts (debug)", "\n".join([f"{n} : {e}" for n, e in yo_errs]), height=200)
 else:
@@ -158,7 +314,9 @@ else:
         st.exception(e)
         st.stop()
 
-    st.image(image, caption="Uploaded image", use_column_width=True)
+    # show uploaded image (use fixed width instead of deprecated use_column_width)
+    display_width = min(900, image.width)
+    st.image(image, caption="Uploaded image", width=display_width)
 
     # Run detection button
     if st.button("🔍 Run Detection (lazy load model if not loaded)"):
@@ -170,9 +328,7 @@ else:
             # Run prediction (wrap in try/except)
             try:
                 # ultralytics model.predict accepts numpy arrays
-                # Passing conf=conf_threshold from sidebar slider
-                results = model_obj.predict(np.array(image), conf=conf_threshold)
-                
+                results = model_obj.predict(np.array(image))
                 if results is None or len(results) == 0:
                     st.warning("Model returned no results object.")
                 else:
@@ -184,31 +340,26 @@ else:
 
                     if boxes is None:
                         st.warning("No boxes attribute found on results — cannot draw detections.")
-                        st.image(draw_img, caption="No detections", use_column_width=True)
+                        st.image(draw_img, caption="No detections", width=min(900, draw_img.width))
                     else:
                         # Try to extract coordinates and confidences robustly
                         try:
+                            # common ultralytics fields: boxes.xyxy and boxes.conf
                             coords = getattr(boxes, "xyxy", None)
                             confs = getattr(boxes, "conf", None)
-                            # convert to numpy arrays when needed
-                            if coords is not None:
-                                try:
-                                    coords_arr = np.array(coords)
-                                except Exception:
-                                    # coords might be a torch tensor-like object
-                                    coords_arr = np.array([list(map(float, c)) for c in coords])
-                            else:
-                                coords_arr = np.array([])
 
-                            if confs is not None:
-                                try:
-                                    confs_arr = np.array(confs)
-                                except Exception:
-                                    confs_arr = np.array([float(c) for c in confs])
-                            else:
-                                confs_arr = None
+                            # convert to numpy arrays when needed using helper
+                            coords_arr = to_numpy(coords) if coords is not None else np.array([])
+                            confs_arr = to_numpy(confs) if confs is not None else None
+
+                            # If coords_arr is 1-D (single box flattened), reshape safely
+                            if coords_arr is not None and isinstance(coords_arr, np.ndarray) and coords_arr.ndim == 1 and coords_arr.size >= 4:
+                                coords_arr = coords_arr.reshape(-1, coords_arr.size)
 
                             # Draw rectangles
+                            if coords_arr is None:
+                                coords_arr = np.array([])
+
                             for i, xy in enumerate(coords_arr):
                                 if len(xy) < 4:
                                     continue
@@ -228,11 +379,11 @@ else:
                             st.error("Error processing detection boxes.")
                             st.exception(inner_e)
 
-                        st.image(draw_img, caption=f"Detections ({count})", use_column_width=True)
+                        st.image(draw_img, caption=f"Detections ({count})", width=min(900, draw_img.width))
                         if count == 0:
-                            st.success(f"No illegal waste detected at {conf_threshold*100:.0f}% confidence.")
+                            st.success("No illegal waste detected (confidence threshold may be high).")
                         else:
-                            st.error(f"Illegal waste detected in {count} region(s) (threshold: {conf_threshold}).")
+                            st.error(f"Illegal waste detected in {count} region(s).")
             except Exception as e:
                 st.error("Error during model prediction. See debug below.")
                 st.text(repr(e))
@@ -243,4 +394,9 @@ else:
 # Footer notes
 # -------------------------
 st.markdown("---")
-st.caption("Note: This app lazy-loads the Ultralytics YOLO class. If you see import errors around `libGL.so.1`, you must install only headless OpenCV (opencv-python-headless) and remove opencv-python from requirements, and delete any local cv2.py file in the repo root.")
+st.caption(
+    "Note: This app lazy-loads the Ultralytics YOLO class. If you see import errors around `libGL.so.1`, "
+    "you must install only headless OpenCV (opencv-python-headless) and remove opencv-python from requirements, "
+    "or install system OpenGL libs (libgl1) if your host supports apt. On some managed hosts (Streamlit Community Cloud) "
+    "you cannot apt; prefer opencv-python-headless or use a host that allows adding system packages (Hugging Face Spaces or Docker-based)."
+)
