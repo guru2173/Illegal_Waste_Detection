@@ -1,6 +1,6 @@
 ##############################################################
 # Streamlit app: Illegal Waste Detection (YOLO)
-# Phase II: Includes Geo-Tagging and Municipal Email Alerts
+# Phase II: Includes Geo-Tagging, Email Alerts, & Session State
 ##############################################################
 import os
 import io
@@ -29,15 +29,19 @@ st.write("Upload an image to detect illegal dumping regions. Model loading is la
 # -------------------------
 st.sidebar.header("Settings")
 model_filename = st.sidebar.text_input("Model filename (in repo root)", "best.pt")
-
 conf_threshold = st.sidebar.slider("Confidence Threshold", min_value=0.0, max_value=1.0, value=0.10, step=0.05)
 st.sidebar.markdown("If YOLO class cannot be imported, follow instructions shown below.")
+
+# -------------------------
+# Initialize Streamlit Memory (Session State)
+# -------------------------
+if 'detection_run' not in st.session_state:
+    st.session_state.detection_run = False
 
 # -------------------------
 # Geo-Tagging Utility Functions
 # -------------------------
 def get_exif_data(image):
-    """Extracts EXIF data from a PIL Image."""
     exif_data = {}
     try:
         info = image._getexif()
@@ -51,7 +55,6 @@ def get_exif_data(image):
                         gps_data[sub_decoded] = value[t]
                     exif_data[decoded] = gps_data
                 else:
-                    # Convert bytes to string for display purposes
                     if isinstance(value, bytes):
                         try: value = value.decode('utf-8')
                         except: value = str(value)
@@ -61,7 +64,6 @@ def get_exif_data(image):
     return exif_data
 
 def convert_to_degrees(value):
-    """Safely converts GPS coordinates to decimal degrees."""
     try:
         d = float(value[0])
         m = float(value[1])
@@ -71,7 +73,6 @@ def convert_to_degrees(value):
         return 0.0
 
 def get_lat_lon(exif_data):
-    """Returns lat/lon from EXIF, or fallback to Alliance University coordinates."""
     try:
         if "GPSInfo" in exif_data:
             gps_info = exif_data["GPSInfo"]
@@ -83,25 +84,23 @@ def get_lat_lon(exif_data):
             if gps_lat and gps_lat_ref and gps_lon and gps_lon_ref:
                 lat = convert_to_degrees(gps_lat)
                 if gps_lat_ref != "N": lat = -lat
-                
                 lon = convert_to_degrees(gps_lon)
                 if gps_lon_ref != "E": lon = -lon
                 
-                if abs(lat) > 1.0 and abs(lon) > 1.0:
-                    return lat, lon, False # False means real data
+                # Lowered the safeguard to allow your 0.23 coordinates
+                if abs(lat) > 0.001 or abs(lon) > 0.001:
+                    return lat, lon, False 
     except Exception:
         pass
         
-    # DEMO MODE FALLBACK: Near Alliance University, Bangalore
     demo_lat = 12.7308 + random.uniform(-0.005, 0.005)
     demo_lon = 77.4827 + random.uniform(-0.005, 0.005)
-    return demo_lat, demo_lon, True # True means Demo Mode
+    return demo_lat, demo_lon, True 
 
 # -------------------------
 # Alert & Notification Utility
 # -------------------------
 def send_municipal_alert(image, count, lat, lon):
-    """Sends an email alert with the detection image and location."""
     try:
         sender_email = st.secrets["email"]["sender_email"]
         sender_password = st.secrets["email"]["sender_password"]
@@ -124,20 +123,16 @@ def send_municipal_alert(image, count, lat, lon):
         img_byte_arr = img_byte_arr.getvalue()
         msg.add_attachment(img_byte_arr, maintype='image', subtype='jpeg', filename='detection_alert.jpg')
 
-        # Connect and send
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
             smtp.login(sender_email, sender_password)
             smtp.send_message(msg)
             
         return True, "Alert sent successfully to Municipal Authorities."
-        
-    except smtplib.SMTPAuthenticationError as e:
-        return False, f"AUTHENTICATION ERROR: Google blocked the login. Please log into {sender_email} on a browser and clear any security alerts. Make sure App Password has no spaces. (Details: {e})"
     except Exception as e:
-        return False, f"SYSTEM ERROR: Failed to send alert. Technical details: {repr(e)}"
+        return False, f"Email failed to send. Error details: {repr(e)}"
 
 # -------------------------
-# Lazy model loader & imports
+# Lazy model loader 
 # -------------------------
 def try_import_yolo():
     errors = []
@@ -162,9 +157,6 @@ def load_model(path: str) -> Tuple[Optional[object], Optional[str]]:
     try: return YOLO_cls(path), None
     except Exception as e: return None, f"Failed to load model '{path}': {repr(e)}"
 
-# -------------------------
-# Sidebar Model Loader UI
-# -------------------------
 st.sidebar.markdown("## Model Loader")
 if st.sidebar.button("Load Model Now"):
     model_obj, model_err = load_model(model_filename)
@@ -175,8 +167,16 @@ if st.sidebar.button("Load Model Now"):
 # Main UI: image upload + detection
 # -------------------------
 uploaded_file = st.file_uploader("Upload image (jpg/jpeg/png)", type=["jpg", "jpeg", "png"])
+
+# Reset memory if a new file is uploaded
+if uploaded_file is not None:
+    if 'last_upload' not in st.session_state or st.session_state.last_upload != uploaded_file.name:
+        st.session_state.detection_run = False
+        st.session_state.last_upload = uploaded_file.name
+
 if uploaded_file is None:
     st.info("Upload an image to run detection (model must be loaded first).")
+    st.session_state.detection_run = False
 else:
     try:
         image = Image.open(uploaded_file).convert("RGB")
@@ -189,18 +189,20 @@ else:
 
     st.image(image, caption="Uploaded image", width=min(700, image.width))
     
-    # NEW: Show the raw metadata to the user
     with st.expander("🔍 Inspect Image Metadata (EXIF)"):
         if not exif_data:
             st.warning("This image file contains NO metadata. GPS cannot be extracted.")
         else:
-            if "GPSInfo" in exif_data:
-                st.success("GPS Data Found!")
-            else:
-                st.warning("Metadata found, but NO GPS data is attached.")
+            if "GPSInfo" in exif_data: st.success("GPS Data Found!")
+            else: st.warning("Metadata found, but NO GPS data is attached.")
             st.json(exif_data)
 
+    # The Detection Button updates the memory
     if st.button("🔍 Run Detection"):
+        st.session_state.detection_run = True
+
+    # If memory says detection was run, display the results and the email button
+    if st.session_state.detection_run:
         model_obj, model_err = load_model(model_filename)
         if model_obj is None:
             st.error("Cannot run detection: model not loaded.")
@@ -241,7 +243,6 @@ else:
                         else:
                             st.error(f"⚠️ Illegal waste detected in {count} region(s)!")
                             
-                            # ---- GEO-TAGGING MODULE UI ----
                             st.markdown("### 📍 Location Data")
                             if is_demo:
                                 st.warning("No GPS data found in image. Using simulated coordinates for demo.")
@@ -252,8 +253,9 @@ else:
                             map_data = pd.DataFrame({'lat': [lat], 'lon': [lon]})
                             st.map(map_data, zoom=14)
                             
-                            # ---- MUNICIPAL RESPONSE MODULE UI ----
                             st.markdown("### 🚨 Municipal Response Network")
+                            
+                            # Because this is outside the detection button, it won't cancel itself!
                             if st.button("📧 Dispatch Municipal Team"):
                                 with st.spinner("Connecting to secure server and dispatching email..."):
                                     if "email" in st.secrets:
