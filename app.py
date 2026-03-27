@@ -30,9 +30,7 @@ st.write("Upload an image to detect illegal dumping regions. Model loading is la
 st.sidebar.header("Settings")
 model_filename = st.sidebar.text_input("Model filename (in repo root)", "best.pt")
 
-# Lowered default confidence to 0.10 for easier detections during demo
 conf_threshold = st.sidebar.slider("Confidence Threshold", min_value=0.0, max_value=1.0, value=0.10, step=0.05)
-
 st.sidebar.markdown("If YOLO class cannot be imported, follow instructions shown below.")
 
 # -------------------------
@@ -53,6 +51,10 @@ def get_exif_data(image):
                         gps_data[sub_decoded] = value[t]
                     exif_data[decoded] = gps_data
                 else:
+                    # Convert bytes to string for display purposes
+                    if isinstance(value, bytes):
+                        try: value = value.decode('utf-8')
+                        except: value = str(value)
                     exif_data[decoded] = value
     except Exception:
         pass
@@ -85,16 +87,15 @@ def get_lat_lon(exif_data):
                 lon = convert_to_degrees(gps_lon)
                 if gps_lon_ref != "E": lon = -lon
                 
-                # Check if coordinates are valid (not stuck in the ocean at 0.0)
                 if abs(lat) > 1.0 and abs(lon) > 1.0:
-                    return lat, lon, False # False means it's real data, not demo
+                    return lat, lon, False # False means real data
     except Exception:
         pass
         
     # DEMO MODE FALLBACK: Near Alliance University, Bangalore
     demo_lat = 12.7308 + random.uniform(-0.005, 0.005)
     demo_lon = 77.4827 + random.uniform(-0.005, 0.005)
-    return demo_lat, demo_lon, True # True means Demo Mode activated
+    return demo_lat, demo_lon, True # True means Demo Mode
 
 # -------------------------
 # Alert & Notification Utility
@@ -118,21 +119,22 @@ def send_municipal_alert(image, count, lat, lon):
         body += "Please find the processed image attached for your review."
         msg.set_content(body)
 
-        # Convert PIL image to bytes
         img_byte_arr = io.BytesIO()
         image.save(img_byte_arr, format='JPEG')
         img_byte_arr = img_byte_arr.getvalue()
-
         msg.add_attachment(img_byte_arr, maintype='image', subtype='jpeg', filename='detection_alert.jpg')
 
-        # Send Email
+        # Connect and send
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
             smtp.login(sender_email, sender_password)
             smtp.send_message(msg)
             
         return True, "Alert sent successfully to Municipal Authorities."
+        
+    except smtplib.SMTPAuthenticationError as e:
+        return False, f"AUTHENTICATION ERROR: Google blocked the login. Please log into {sender_email} on a browser and clear any security alerts. Make sure App Password has no spaces. (Details: {e})"
     except Exception as e:
-        return False, f"Failed to send alert. Technical Error: {repr(e)}"
+        return False, f"SYSTEM ERROR: Failed to send alert. Technical details: {repr(e)}"
 
 # -------------------------
 # Lazy model loader & imports
@@ -143,7 +145,6 @@ def try_import_yolo():
         ultralytics = importlib.import_module("ultralytics")
         YOLO_cls = getattr(ultralytics, "YOLO", None)
         if YOLO_cls is not None: return YOLO_cls, errors
-        errors.append(("ultralytics module", "YOLO attribute missing"))
     except Exception as e: errors.append(("from ultralytics import YOLO", repr(e)))
 
     try:
@@ -187,6 +188,17 @@ else:
         st.stop()
 
     st.image(image, caption="Uploaded image", width=min(700, image.width))
+    
+    # NEW: Show the raw metadata to the user
+    with st.expander("🔍 Inspect Image Metadata (EXIF)"):
+        if not exif_data:
+            st.warning("This image file contains NO metadata. GPS cannot be extracted.")
+        else:
+            if "GPSInfo" in exif_data:
+                st.success("GPS Data Found!")
+            else:
+                st.warning("Metadata found, but NO GPS data is attached.")
+            st.json(exif_data)
 
     if st.button("🔍 Run Detection"):
         model_obj, model_err = load_model(model_filename)
@@ -250,7 +262,6 @@ else:
                                             st.success(msg)
                                             st.balloons()
                                         else:
-                                            # This will print the exact reason if Google blocks the email
                                             st.error(msg) 
                                     else:
                                         st.error("Secrets missing. Add 'email' credentials to App Settings -> Secrets.")
