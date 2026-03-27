@@ -1,17 +1,19 @@
 ##############################################################
 # Streamlit app: Illegal Waste Detection (YOLO)
-# - avoids top-level `from ultralytics import YOLO`
-# - lazy-imports Ultralytics inside load_model / try_import_yolo
-# - does not import cv2 for inference or drawing (uses PIL)
-# - prints helpful debug messages when imports fail
+# Phase II: Includes Geo-Tagging and Municipal Email Alerts
 ##############################################################
 import os
+import io
 import importlib
 import traceback
+import smtplib
+from email.message import EmailMessage
 from typing import Tuple, Optional
 
 import streamlit as st
+import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
+from PIL.ExifTags import TAGS, GPSTAGS
 import numpy as np
 
 # small env tweak (keeps OpenEXR disabled)
@@ -33,65 +35,119 @@ conf_threshold = st.sidebar.slider("Confidence Threshold", min_value=0.0, max_va
 st.sidebar.markdown("If YOLO class cannot be imported, follow instructions shown below.")
 
 # -------------------------
-# Utility: detect OpenCV debug info (no heavy import-time crash)
+# Geo-Tagging Utility Functions
 # -------------------------
-def opencv_debug() -> str:
-    """
-    Try to import cv2 and return short diagnostic text.
-    If import raises an ImportError (libGL missing etc), return that message.
-    """
+def get_exif_data(image):
+    """Extracts EXIF data from a PIL Image."""
+    exif_data = {}
     try:
-        import cv2
-        ver = getattr(cv2, "__version__", "unknown")
-        path = getattr(cv2, "__file__", "unknown")
-        # check whether imshow exists (sometimes headless packages don't expose GUI functions)
-        has_imshow = hasattr(cv2, "imshow")
-        return f"cv2 version: {ver}\ncv2 file: {path}\nimshow available: {has_imshow}"
-    except Exception as e:
-        return f"cv2 import error: {repr(e)}"
+        info = image._getexif()
+        if info:
+            for tag, value in info.items():
+                decoded = TAGS.get(tag, tag)
+                if decoded == "GPSInfo":
+                    gps_data = {}
+                    for t in value:
+                        sub_decoded = GPSTAGS.get(t, t)
+                        gps_data[sub_decoded] = value[t]
+                    exif_data[decoded] = gps_data
+                else:
+                    exif_data[decoded] = value
+    except Exception:
+        pass
+    return exif_data
 
-# show OpenCV diagnostic to developer
-st.sidebar.text_area("OpenCV debug", value=opencv_debug(), height=120)
+def convert_to_degrees(value):
+    """Converts GPS coordinates to decimal degrees."""
+    d, m, s = value
+    return d + (m / 60.0) + (s / 3600.0)
+
+def get_lat_lon(exif_data):
+    """Returns latitude and longitude if available from EXIF data."""
+    if "GPSInfo" in exif_data:
+        gps_info = exif_data["GPSInfo"]
+        gps_lat = gps_info.get("GPSLatitude")
+        gps_lat_ref = gps_info.get("GPSLatitudeRef")
+        gps_lon = gps_info.get("GPSLongitude")
+        gps_lon_ref = gps_info.get("GPSLongitudeRef")
+
+        if gps_lat and gps_lat_ref and gps_lon and gps_lon_ref:
+            lat = convert_to_degrees(gps_lat)
+            if gps_lat_ref != "N":
+                lat = -lat
+            lon = convert_to_degrees(gps_lon)
+            if gps_lon_ref != "E":
+                lon = -lon
+            return lat, lon
+    return None, None
+
+# -------------------------
+# Alert & Notification Utility
+# -------------------------
+def send_municipal_alert(image, count, lat, lon):
+    """Sends an email alert with the detection image and location."""
+    try:
+        # Retrieve credentials from Streamlit Secrets
+        sender_email = st.secrets["email"]["sender_email"]
+        sender_password = st.secrets["email"]["sender_password"]
+        receiver_email = st.secrets["email"]["receiver_email"]
+
+        msg = EmailMessage()
+        msg['Subject'] = f"🚨 URGENT: Illegal Waste Dumping Detected ({count} region(s))"
+        msg['From'] = sender_email
+        msg['To'] = receiver_email
+
+        # Construct email body
+        body = f"An automated detection of illegal waste dumping has been flagged.\n\n"
+        body += f"Total Detections: {count}\n"
+        
+        if lat is not None and lon is not None:
+            body += f"Location Coordinates: {lat:.6f}, {lon:.6f}\n"
+            body += f"Google Maps Link: https://www.google.com/maps?q={lat},{lon}\n\n"
+        else:
+            body += "Location: GPS data not available for this image.\n\n"
+            
+        body += "Please find the processed image attached for your review."
+        msg.set_content(body)
+
+        # Convert PIL image to bytes for attachment
+        img_byte_arr = io.BytesIO()
+        image.save(img_byte_arr, format='JPEG')
+        img_byte_arr = img_byte_arr.getvalue()
+
+        msg.add_attachment(img_byte_arr, maintype='image', subtype='jpeg', filename='detection_alert.jpg')
+
+        # Connect to Gmail SMTP server and send
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+            smtp.login(sender_email, sender_password)
+            smtp.send_message(msg)
+            
+        return True, "Alert sent successfully to Municipal Authorities."
+    except Exception as e:
+        return False, f"Failed to send alert. Error: {str(e)}"
 
 # -------------------------
 # Attempt to import YOLO (lazy)
 # -------------------------
 def try_import_yolo():
-    """
-    Attempt several import paths for the YOLO class.
-    Returns (YOLO_class_or_None, list_of_errors)
-    """
     errors = []
-
-    # Attempt 1: public API
     try:
         ultralytics = importlib.import_module("ultralytics")
         YOLO_cls = getattr(ultralytics, "YOLO", None)
         if YOLO_cls is not None:
             return YOLO_cls, errors
-        errors.append(("ultralytics module; YOLO attr missing", "ultralytics imported but YOLO attribute not present"))
+        errors.append(("ultralytics module", "YOLO attribute missing"))
     except Exception as e:
         errors.append(("from ultralytics import YOLO", repr(e)))
 
-    # Attempt 2: submodule used by some versions
     try:
         mod = importlib.import_module("ultralytics.yolo.engine.model")
         YOLO_cls = getattr(mod, "YOLO", None)
         if YOLO_cls is not None:
             return YOLO_cls, errors
-        errors.append(("ultralytics.yolo.engine.model; YOLO attr missing", "module loaded but YOLO attribute missing"))
+        errors.append(("ultralytics.yolo.engine.model", "YOLO attribute missing"))
     except Exception as e:
         errors.append(("import ultralytics.yolo.engine.model", repr(e)))
-
-    # Attempt 3: other submodule path
-    try:
-        mod2 = importlib.import_module("ultralytics.yolo")
-        YOLO_cls = getattr(mod2, "YOLO", None)
-        if YOLO_cls is not None:
-            return YOLO_cls, errors
-        errors.append(("ultralytics.yolo; YOLO not found", "module loaded but YOLO attribute missing"))
-    except Exception as e:
-        errors.append(("import ultralytics.yolo", repr(e)))
 
     return None, errors
 
@@ -100,27 +156,21 @@ def try_import_yolo():
 # -------------------------
 @st.cache_resource
 def load_model(path: str) -> Tuple[Optional[object], Optional[str]]:
-    """
-    Returns (model_object_or_None, error_message_or_None)
-    """
     YOLO_cls, import_errors = try_import_yolo()
     if YOLO_cls is None:
-        # build error message summarizing import attempts
         msg_lines = ["Unable to import YOLO class. Import attempts:"]
         for name, err in import_errors:
             msg_lines.append(f"- {name}: {err}")
         return None, "\n".join(msg_lines)
 
-    # YOLO class present: try to load the .pt file
     if not os.path.exists(path):
-        return None, f"Model file '{path}' not found in repo root. Upload it to repository root or change filename."
+        return None, f"Model file '{path}' not found in repo root."
 
     try:
-        model = YOLO_cls(path)  # instantiate model with weights
+        model = YOLO_cls(path)  
         return model, None
     except Exception as e:
-        tb = traceback.format_exc()
-        return None, f"YOLO import ok but failed to load model '{path}': {repr(e)}\nFull traceback:\n{tb}"
+        return None, f"Failed to load model '{path}': {repr(e)}"
 
 # -------------------------
 # Sidebar Model Loader UI
@@ -130,19 +180,8 @@ if st.sidebar.button("Load Model Now"):
     model_obj, model_err = load_model(model_filename)
     if model_obj is None:
         st.sidebar.error("Model NOT loaded.")
-        st.sidebar.text_area("Load errors (copy for debugging)", value=model_err or "unknown", height=260)
     else:
-        st.sidebar.success("Model loaded successfully. You can run detection from main UI.")
-
-# quick check: indicate whether YOLO class is importable (without loading weights)
-yo_cls, yo_errs = try_import_yolo()
-if yo_cls is None:
-    st.sidebar.error("⚠️ YOLO class NOT available.")
-    st.sidebar.markdown("Try:\n- Ensure `ultralytics` is in `requirements.txt`.\n- Pin `ultralytics==8.3.235` in `requirements.txt`.\n- Delete any `cv2.py` file in repo root (it shadows real OpenCV).")
-    # show debug lines
-    st.sidebar.text_area("YOLO import attempts (debug)", "\n".join([f"{n} : {e}" for n, e in yo_errs]), height=200)
-else:
-    st.sidebar.success("YOLO class appears importable.")
+        st.sidebar.success("Model loaded successfully.")
 
 # -------------------------
 # Main UI: image upload + detection
@@ -152,95 +191,98 @@ if uploaded_file is None:
     st.info("Upload an image to run detection (model must be loaded first).")
 else:
     try:
+        # Load image for detection
         image = Image.open(uploaded_file).convert("RGB")
+        
+        # Reload image strictly for EXIF data (converting to RGB sometimes strips it)
+        raw_image = Image.open(uploaded_file)
+        exif_data = get_exif_data(raw_image)
+        lat, lon = get_lat_lon(exif_data)
+        
     except Exception as e:
         st.error("Could not open uploaded file as image.")
-        st.exception(e)
         st.stop()
 
     st.image(image, caption="Uploaded image", width=min(700, image.width))
 
     # Run detection button
-    if st.button("🔍 Run Detection (lazy load model if not loaded)"):
+    if st.button("🔍 Run Detection"):
         model_obj, model_err = load_model(model_filename)
         if model_obj is None:
             st.error("Cannot run detection: model not loaded.")
             st.text(model_err)
         else:
-            # Run prediction (wrap in try/except)
-            try:
-                # ultralytics model.predict accepts numpy arrays
-                # Passing conf=conf_threshold from sidebar slider
-                results = model_obj.predict(np.array(image), conf=conf_threshold)
-                
-                if results is None or len(results) == 0:
-                    st.warning("Model returned no results object.")
-                else:
-                    res0 = results[0]
-                    boxes = getattr(res0, "boxes", None)
-                    draw_img = image.copy()
-                    draw = ImageDraw.Draw(draw_img)
-                    count = 0
-
-                    if boxes is None:
-                        st.warning("No boxes attribute found on results — cannot draw detections.")
-                        st.image(draw_img, caption="No detections", width=min(700, draw_img.width))
+            with st.spinner("Analyzing image..."):
+                try:
+                    results = model_obj.predict(np.array(image), conf=conf_threshold)
+                    
+                    if results is None or len(results) == 0:
+                        st.warning("Model returned no results object.")
                     else:
-                        # Try to extract coordinates and confidences robustly
-                        try:
-                            coords = getattr(boxes, "xyxy", None)
-                            confs = getattr(boxes, "conf", None)
-                            # convert to numpy arrays when needed
-                            if coords is not None:
-                                try:
-                                    coords_arr = np.array(coords)
-                                except Exception:
-                                    # coords might be a torch tensor-like object
-                                    coords_arr = np.array([list(map(float, c)) for c in coords])
-                            else:
-                                coords_arr = np.array([])
+                        res0 = results[0]
+                        boxes = getattr(res0, "boxes", None)
+                        draw_img = image.copy()
+                        draw = ImageDraw.Draw(draw_img)
+                        count = 0
 
-                            if confs is not None:
-                                try:
-                                    confs_arr = np.array(confs)
-                                except Exception:
-                                    confs_arr = np.array([float(c) for c in confs])
-                            else:
-                                confs_arr = None
+                        if boxes is not None:
+                            try:
+                                coords = getattr(boxes, "xyxy", None)
+                                confs = getattr(boxes, "conf", None)
+                                
+                                coords_arr = np.array(coords) if coords is not None else np.array([])
+                                # Handle torch tensor reshape issue safely
+                                if coords_arr.ndim == 1 and coords_arr.size >= 4:
+                                    coords_arr = coords_arr.reshape(-1, 4)
+                                    
+                                confs_arr = np.array(confs) if confs is not None else np.array([])
 
-                            # Draw rectangles
-                            for i, xy in enumerate(coords_arr):
-                                if len(xy) < 4:
-                                    continue
-                                x1, y1, x2, y2 = map(float, xy[:4])
-                                conf = float(confs_arr[i]) if (confs_arr is not None and i < len(confs_arr)) else 0.0
-                                draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
-                                # choose a readable font size (fallback if not available)
-                                try:
-                                    font = ImageFont.truetype("DejaVuSans.ttf", size=16)
-                                except Exception:
-                                    font = None
-                                txt = f"{conf*100:.1f}%"
-                                draw.text((x1 + 4, y1 + 4), txt, fill="red", font=font)
-                                count += 1
+                                for i, xy in enumerate(coords_arr):
+                                    if len(xy) < 4: continue
+                                    x1, y1, x2, y2 = map(float, xy[:4])
+                                    conf = float(confs_arr[i]) if i < len(confs_arr) else 0.0
+                                    
+                                    draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
+                                    txt = f"Waste {conf*100:.1f}%"
+                                    draw.text((x1 + 4, y1 + 4), txt, fill="red")
+                                    count += 1
 
-                        except Exception as inner_e:
-                            st.error("Error processing detection boxes.")
-                            st.exception(inner_e)
+                            except Exception as inner_e:
+                                st.error(f"Error drawing boxes: {inner_e}")
 
                         st.image(draw_img, caption=f"Detections ({count})", width=min(700, draw_img.width))
+                        
                         if count == 0:
-                            st.success(f"No illegal waste detected at {conf_threshold*100:.0f}% confidence.")
+                            st.success(f"✅ No illegal waste detected at {conf_threshold*100:.0f}% confidence.")
                         else:
-                            st.error(f"Illegal waste detected in {count} region(s) (threshold: {conf_threshold}).")
-            except Exception as e:
-                st.error("Error during model prediction. See debug below.")
-                st.text(repr(e))
-                with st.expander("Full traceback"):
-                    st.text(traceback.format_exc())
+                            st.error(f"⚠️ Illegal waste detected in {count} region(s)!")
+                            
+                            # ---- GEO-TAGGING MODULE UI ----
+                            st.markdown("### 📍 Location Data")
+                            if lat is not None and lon is not None:
+                                st.success(f"GPS Coordinates Found: {lat:.5f}, {lon:.5f}")
+                                map_data = pd.DataFrame({'lat': [lat], 'lon': [lon]})
+                                st.map(map_data, zoom=15)
+                            else:
+                                st.warning("No GPS data found in this image's EXIF metadata. (Ensure location services are on when taking the photo).")
+                            
+                            # ---- MUNICIPAL RESPONSE MODULE UI ----
+                            st.markdown("### 🚨 Municipal Response Network")
+                            if st.button("📧 Dispatch Municipal Team"):
+                                with st.spinner("Connecting to secure server and dispatching email..."):
+                                    # Ensure secrets exist before trying to send
+                                    if "email" in st.secrets:
+                                        success, msg = send_municipal_alert(draw_img, count, lat, lon)
+                                        if success:
+                                            st.success(msg)
+                                            st.balloons()
+                                        else:
+                                            st.error(msg)
+                                    else:
+                                        st.error("Email configuration missing. Please add 'email' credentials to App Settings -> Secrets.")
 
-# -------------------------
-# Footer notes
-# -------------------------
+                except Exception as e:
+                    st.error(f"Error during model prediction: {e}")
+
 st.markdown("---")
-st.caption("Note: This app lazy-loads the Ultralytics YOLO class. If you see import errors around `libGL.so.1`, you must install only headless OpenCV (opencv-python-headless) and remove opencv-python from requirements, and delete any local cv2.py file in the repo root.")
+st.caption("Capstone Phase II: Smart Illegal Waste Dumping Detection and Municipal Response Network")
